@@ -1,0 +1,10 @@
+aiohttp
+aiofiles
+sqlalchemy
+psycopg2-binary
+sentence-transformers
+xarray
+netCDF4
+python-dotenv
+streamlit
+pgvector
