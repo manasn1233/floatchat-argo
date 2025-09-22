@@ -1,0 +1,35 @@
+name: Ingest IFREMER NetCDFs
+
+on:
+  workflow_dispatch:        # manual run from Actions tab
+  schedule:                 # scheduled run (every day at 02:00 UTC) - adjust as needed
+    - cron: '0 2 * * *'
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Create data dir
+        run: |
+          mkdir -p ./data/netcdf
+
+      - name: Run orchestration (crawl/download/ingest)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          # optional: set DATA_DIR secret or env if you prefer a different path
+        run: |
+          python -m scripts.run_once
