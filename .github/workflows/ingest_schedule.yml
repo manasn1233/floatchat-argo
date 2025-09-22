@@ -1,35 +1,81 @@
 name: Ingest IFREMER NetCDFs
 
+# Manual + scheduled run
 on:
-  workflow_dispatch:        # manual run from Actions tab
-  schedule:                 # scheduled run (every day at 02:00 UTC) - adjust as needed
-    - cron: '0 2 * * *'
+  workflow_dispatch: {}
+  schedule:
+    - cron: '0 2 * * *'  # daily at 02:00 UTC (edit as needed)
+
+concurrency:
+  group: ingest-ifremer-netcdfs
+  cancel-in-progress: true
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    env:
+      # Required: set this secret in repo Settings -> Secrets and variables -> Actions
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      # Optional: set this secret if you want Gemini generation enabled
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      # Tunables (can be adjusted here or read from Python env)
+      CI_MAX_YEARS: "1"
+      MAX_SIZE_BYTES: "62914560"   # 60 MiB
+      DOWNLOAD_CONCURRENCY: "3"
+      DOWNLOAD_RETRIES: "4"
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.10
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: "3.10"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else echo "No requirements.txt found"; fi
 
       - name: Create data dir
         run: |
           mkdir -p ./data/netcdf
 
+      - name: Show Python + env info
+        run: |
+          python -V
+          echo "DATABASE_URL is set: ${DATABASE_URL:+yes}"
+          echo "GEMINI_API_KEY is set: ${GEMINI_API_KEY:+yes}"
+          echo "CI_MAX_YEARS=${CI_MAX_YEARS}"
+          echo "MAX_SIZE_BYTES=${MAX_SIZE_BYTES}"
+          echo "DOWNLOAD_CONCURRENCY=${DOWNLOAD_CONCURRENCY}"
+          echo "DOWNLOAD_RETRIES=${DOWNLOAD_RETRIES}"
+
+      - name: Run schema (idempotent)
+        run: |
+          python -m scripts.run_schema || true
+
       - name: Run orchestration (crawl/download/ingest)
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          # optional: set DATA_DIR secret or env if you prefer a different path
+        # The scripts/readme assumes scripts/run_once.py reads CI_MAX_YEARS constant.
+        # Passing env above ensures the script can also read os.getenv if you adjust it later.
         run: |
           python -m scripts.run_once
+
+      - name: Upload data artifact (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingest-logs-${{ github.run_id }}
+          path: |
+            ./*.log
+            ./data/netcdf/**/*
