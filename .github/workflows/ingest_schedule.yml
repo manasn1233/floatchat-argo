@@ -1,4 +1,4 @@
-name: Ingest IFREMER NetCDFs
+name: Ingest IFREMER NetCDFs (Indian Ocean 2025 only)
 
 # Manual + scheduled run
 on:
@@ -24,6 +24,10 @@ jobs:
       MAX_SIZE_BYTES: "62914560"   # 60 MiB
       DOWNLOAD_CONCURRENCY: "3"
       DOWNLOAD_RETRIES: "4"
+
+      # NEW: restrict to Indian Ocean 2025 only
+      ROOT_URL: "https://data-argo.ifremer.fr/geo/indian_ocean/2025/"
+      MIN_YEAR: "2025"
 
     steps:
       - name: Checkout repo
@@ -60,14 +64,21 @@ jobs:
           echo "MAX_SIZE_BYTES=${MAX_SIZE_BYTES}"
           echo "DOWNLOAD_CONCURRENCY=${DOWNLOAD_CONCURRENCY}"
           echo "DOWNLOAD_RETRIES=${DOWNLOAD_RETRIES}"
+          echo "ROOT_URL=${ROOT_URL}"
+          echo "MIN_YEAR=${MIN_YEAR}"
 
       - name: Run schema (idempotent)
         run: |
           python -m scripts.run_schema || true
 
       - name: Run orchestration (crawl/download/ingest)
-        # The scripts/readme assumes scripts/run_once.py reads CI_MAX_YEARS constant.
-        # Passing env above ensures the script can also read os.getenv if you adjust it later.
+        # scripts/run_once.py should read ROOT_URL/MIN_YEAR or fall back to defaults.
+        env:
+          # re-export so child processes see them
+          ROOT_URL: ${{ env.ROOT_URL }}
+          MIN_YEAR: ${{ env.MIN_YEAR }}
+          CI_MAX_YEARS: ${{ env.CI_MAX_YEARS }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           python -m scripts.run_once
 
