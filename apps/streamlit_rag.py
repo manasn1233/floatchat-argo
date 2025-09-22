@@ -30,7 +30,6 @@ def get_secret(key: str) -> Optional[str]:
         if hasattr(st, "secrets") and st.secrets and key in st.secrets:
             return st.secrets[key]
     except Exception:
-        # st.secrets may not be available in some runtimes
         pass
     return os.getenv(key)
 
@@ -47,8 +46,8 @@ if not DATABASE_URL:
     )
     st.stop()
 
+# Mask DB URL for display
 def mask_db_url(url: str) -> str:
-    """Show only host portion of DB URL for display, do not reveal credentials."""
     try:
         parts = url.split("@")
         if len(parts) == 2:
@@ -96,16 +95,15 @@ def fetch_candidates(year: Optional[int], region: Optional[str],
                      limit: int = 200) -> List[Dict]:
     """
     Fetch candidate rows from netcdf_files table.
-    Assumes table netcdf_files has columns: id, file_url, file_name, year, ocean_region, summary, lat_min, lat_max, lon_min, lon_max, time_start
+    Falls back to inferring year from file_name if DB.year is NULL.
     """
     clauses = []
     params = {}
-    if year:
-        clauses.append("year = :year")
-        params["year"] = int(year)
+
     if region and region != "all":
         clauses.append("ocean_region = :region")
         params["region"] = region
+
     if lat_min is not None:
         clauses.append("lat_max >= :lat_min")
         params["lat_min"] = lat_min
@@ -121,18 +119,30 @@ def fetch_candidates(year: Optional[int], region: Optional[str],
 
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     sql = f"""
-    SELECT id, file_url, file_name, year, ocean_region, summary, lat_min, lat_max, lon_min, lon_max, time_start, time_end
+    SELECT id, file_url, file_name, year, ocean_region, summary,
+           lat_min, lat_max, lon_min, lon_max, time_start, time_end
     FROM netcdf_files
     {where}
     ORDER BY id DESC
     LIMIT :limit
     """
     params["limit"] = limit
+    results = []
     with engine.connect() as conn:
         rows = conn.execute(text(sql), params).fetchall()
-    results = []
-    for r in rows:
-        results.append(dict(r._mapping))
+        for r in rows:
+            rec = dict(r._mapping)
+            # Infer year if missing
+            if not rec.get("year") and rec.get("file_name"):
+                try:
+                    rec["year"] = int(rec["file_name"][:4])
+                except Exception:
+                    pass
+            results.append(rec)
+
+    # Apply year filter after fallback
+    if year:
+        results = [r for r in results if str(r.get("year")) == str(year)]
     return results
 
 def embed_texts(texts: List[str]) -> np.ndarray:
@@ -172,7 +182,7 @@ st.title("FloatChat — RAG (NetCDF metadata)")
 with st.sidebar:
     st.markdown("### Filters")
     year = st.number_input("Year", min_value=1900, max_value=2100, value=2025, step=1)
-    region = st.selectbox("Region", options=["indian_2025", "indian", "atlantic", "all"], index=0)
+    region = st.selectbox("Region", options=["indian", "atlantic", "all"], index=0)
     use_bbox = st.checkbox("Filter by bounding box (lat/lon)?", value=False)
     lat_min = lat_max = lon_min = lon_max = None
     if use_bbox:
@@ -212,7 +222,6 @@ if run:
             st.caption(f"url: {doc.get('file_url')}")
             st.write("---")
 
-        # Generate answer (Gemini if configured, else local synth)
         if GEMINI_API_KEY and GEMINI_PACKAGE_AVAILABLE:
             with st.spinner("Generating answer with Gemini..."):
                 ans = generate_with_gemini(question, top)
