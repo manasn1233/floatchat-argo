@@ -1,31 +1,64 @@
 # apps/streamlit_rag.py
 """
 Streamlit RAG chat for FloatChat (NetCDF metadata + summaries).
-- Queries Postgres for netcdf_files filtered by year/region/bbox.
-- Re-ranks candidate summaries using SBERT embeddings (local) and cosine similarity.
-- Optionally calls Gemini (if GEMINI_API_KEY is set in secrets or env).
+- Primary source: query Postgres (Supabase) for metadata rows and build/load FAISS from them.
+- Fallback: if DB unavailable or returns no rows, use a local sample meta.json and build FAISS from it.
+- Re-ranks with SBERT and cosine similarity.
+- Optional: Gemini generation if package & GEMINI_API_KEY available (read from env or Streamlit secrets).
+- Optional: gTTS TTS playback when available.
+
+Notes:
+- Do NOT hardcode secrets. Set DATABASE_URL and GEMINI_API_KEY as environment variables or Streamlit secrets.
+- Add `faiss-cpu`, `sentence-transformers`, `sqlalchemy`, `psycopg2-binary`, and `gtts` to requirements if you need those features.
 """
 
 import os
+import json
+import time
+import tempfile
 import html
+from datetime import datetime
 from typing import List, Dict, Optional
 
 import streamlit as st
 import numpy as np
-import sqlalchemy
-from sqlalchemy import text
 from sentence_transformers import SentenceTransformer
 
-# Optional Gemini package
+# Optional imports
+try:
+    import faiss
+    FAISS_AVAILABLE = True
+except Exception:
+    FAISS_AVAILABLE = False
+
 try:
     import google.generativeai as genai
     GEMINI_PACKAGE_AVAILABLE = True
 except Exception:
     GEMINI_PACKAGE_AVAILABLE = False
 
-# ---------------- Helpers to read secrets ----------------
+try:
+    from gtts import gTTS
+    GTTS_AVAILABLE = True
+except Exception:
+    GTTS_AVAILABLE = False
+
+# Try to import SQLAlchemy for DB access (optional)
+try:
+    import sqlalchemy
+    from sqlalchemy import text
+    DB_AVAILABLE = True
+except Exception:
+    DB_AVAILABLE = False
+
+# ---------------- CONFIG ----------------
+PERSIST_DIR = os.getenv("PERSIST_DIR", "./faiss_db_proto")
+INDEX_PATH = os.path.join(PERSIST_DIR, "faiss_index.bin")
+META_PATH = os.path.join(PERSIST_DIR, "meta.json")
+os.makedirs(PERSIST_DIR, exist_ok=True)
+
+# Read Gemini key from env / streamlit secrets (do NOT hardcode)
 def get_secret(key: str) -> Optional[str]:
-    """Prefer streamlit secrets, fallback to environment variable."""
     try:
         if hasattr(st, "secrets") and st.secrets and key in st.secrets:
             return st.secrets[key]
@@ -33,51 +66,142 @@ def get_secret(key: str) -> Optional[str]:
         pass
     return os.getenv(key)
 
-DATABASE_URL = get_secret("DATABASE_URL")
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY", "")
 
-# Friendly message if no DB configured
-if not DATABASE_URL:
-    st.set_page_config(page_title="FloatChat — RAG", layout="centered")
-    st.title("FloatChat — RAG (NetCDF metadata)")
-    st.error(
-        "DATABASE_URL is not configured. On Streamlit Cloud add it under Settings → Secrets as `DATABASE_URL`. "
-        "Locally export DATABASE_URL before running the app."
-    )
-    st.stop()
-
-# Mask DB URL for display
-def mask_db_url(url: str) -> str:
+MODEL_HANDLE = None
+if GEMINI_PACKAGE_AVAILABLE and GEMINI_API_KEY:
     try:
-        parts = url.split("@")
-        if len(parts) == 2:
-            return f"...@{parts[1]}"
-    except Exception:
-        pass
-    return "configured"
+        genai.configure(api_key=GEMINI_API_KEY)
+        MODEL_HANDLE = genai.GenerativeModel("gemini-1.5-pro")
+    except Exception as e:
+        # Do not fail app if Gemini init fails
+        st.warning(f"Could not initialize Gemini model: {e}")
+        MODEL_HANDLE = None
 
-# ---------------- DB engine & model loading (cached) ----------------
-@st.cache_resource(show_spinner=False)
-def get_engine(db_url: str):
-    return sqlalchemy.create_engine(db_url, future=True)
+# ---------------- CSS ----------------
+CSS = """<style>
+header, footer {visibility:hidden; height:0;}
+.topbar {position:fixed; top:0; left:0; right:0; height:60px;
+ background:linear-gradient(90deg,#0077cc,#004e92); display:flex; align-items:center; justify-content:center;
+ color:#fff; font-weight:700; font-family:"Segoe UI",sans-serif; z-index:9999;}
+.messages {display:flex; flex-direction:column-reverse; overflow-y:auto; max-height:480px; padding:12px;
+ background:linear-gradient(180deg,#cfeffd,#e7fbff); border-radius:12px; border:1px solid rgba(0,0,0,0.04);} 
+.bubble {max-width:72%; padding:10px 12px; border-radius:12px; margin:8px 0; font-size:14px;}
+.user {margin-left:auto; background:linear-gradient(135deg,#d6f7e0,#bff0c6);} 
+.bot {margin-right:auto; background:#fff; border:1px solid rgba(0,0,0,0.03);} 
+.meta {font-size:11px; color:#4b6b7a; margin-top:6px;}
+</style>"""
+st.markdown(CSS, unsafe_allow_html=True)
 
+# ---------------- Init resources ----------------
 @st.cache_resource(show_spinner=False)
 def load_sbert_model():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
-engine = get_engine(DATABASE_URL)
-sbert = load_sbert_model()
+# model variable kept to match earlier code
+model = load_sbert_model()
 
-# ---------------- Gemini helper ----------------
-def generate_with_gemini(question: str, top_docs: List[Dict]) -> str:
-    if not GEMINI_PACKAGE_AVAILABLE or not GEMINI_API_KEY:
-        return ""
+# ---------------- Build/load FAISS index (DB-aware) ----------------
+@st.cache_resource(show_spinner=False)
+def build_or_load_index():
+    """
+    Build or load a FAISS index and metadata list.
+    Priority:
+      1) If DATABASE_URL present and SQLAlchemy available: fetch metadata rows (limited), build index from summaries, and persist meta locally.
+      2) Else, if META_PATH exists: load it and build index.
+      3) Else: fallback to a small set of sample docs.
+    Returns: (index_or_None, meta_list)
+    """
+    meta_list: List[Dict] = []
+    # 1) Try DB
+    db_url = get_secret("DATABASE_URL") or os.getenv("DATABASE_URL")
+    if db_url and DB_AVAILABLE:
+        try:
+            engine = sqlalchemy.create_engine(db_url, future=True)
+            q = text("""
+                SELECT file_url, file_name, coalesce(summary, '') AS summary, COALESCE(year, NULL) as year
+                FROM netcdf_files
+                ORDER BY id DESC
+                LIMIT 5000
+            """)
+            with engine.connect() as conn:
+                rows = conn.execute(q).fetchall()
+            if rows:
+                for r in rows:
+                    rec = dict(r._mapping)
+                    meta_list.append({
+                        "id": rec.get("file_url"),
+                        "file_name": rec.get("file_name"),
+                        "file_url": rec.get("file_url"),
+                        "summary": rec.get("summary") or "",
+                        "year": rec.get("year")
+                    })
+                # persist a local copy for faster startup next time
+                try:
+                    with open(META_PATH, "w", encoding="utf-8") as f:
+                        json.dump(meta_list, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+        except Exception as e:
+            # don't raise; fallback to local
+            st.warning(f"Could not fetch metadata from DB (falling back to local): {e}")
+            meta_list = []
+
+    # 2) If DB didn't populate meta_list, try file
+    if not meta_list and os.path.exists(META_PATH):
+        try:
+            with open(META_PATH, "r", encoding="utf-8") as f:
+                meta_list = json.load(f)
+        except Exception:
+            meta_list = []
+
+    # 3) fallback sample
+    if not meta_list:
+        meta_list = [
+            {"id": "R_sample_001", "file_name": "sample_2023_01.nc", "file_url": "local://sample_2023_01", "summary": "Salinity profile near 7N,75E recorded on 2023-03-15.", "year": 2023},
+            {"id": "R_sample_002", "file_name": "sample_2023_02.nc", "file_url": "local://sample_2023_02", "summary": "Temperature profile near 10N,70E on 2023-02-10.", "year": 2023},
+            {"id": "R_sample_003", "file_name": "sample_2023_03.nc", "file_url": "local://sample_2023_03", "summary": "BGC float near 5N,72E: chlorophyll elevated at surface.", "year": 2023},
+        ]
+        try:
+            with open(META_PATH, "w", encoding="utf-8") as f:
+                json.dump(meta_list, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    # Build embeddings and FAISS index when possible
+    texts = [m.get("summary", "") for m in meta_list]
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-1.5-pro")
-        context = "\n\n".join(f"[DOC {i+1}] {d['doc'].get('summary')[:1000]}" for i, d in enumerate(top_docs))
-        prompt = f"{context}\n\nUser question: {question}\nAnswer concisely using the above documents:"
-        resp = model.generate_content(prompt, generation_config={"max_output_tokens":400, "temperature":0.2})
+        embs = model.encode(texts, show_progress_bar=False)
+        arr = np.array(embs).astype("float32")
+    except Exception as e:
+        st.error(f"Failed to compute embeddings: {e}")
+        return None, meta_list
+
+    if FAISS_AVAILABLE:
+        try:
+            faiss.normalize_L2(arr)
+            d = arr.shape[1]
+            index = faiss.IndexFlatIP(d)
+            index.add(arr)
+            try:
+                faiss.write_index(index, INDEX_PATH)
+            except Exception:
+                pass
+            return index, meta_list
+        except Exception as e:
+            st.warning(f"FAISS build failed, will use numpy search instead: {e}")
+            return None, meta_list
+    else:
+        # no FAISS: still return meta_list and None for index (we'll do numpy ranking)
+        return None, meta_list
+
+# build or load
+index, meta = build_or_load_index()
+
+# ---------------- Helpers ----------------
+
+def _extract_text(resp):
+    try:
         if hasattr(resp, "text") and resp.text:
             return resp.text
         if hasattr(resp, "candidates") and resp.candidates:
@@ -85,152 +209,144 @@ def generate_with_gemini(question: str, top_docs: List[Dict]) -> str:
             if hasattr(c, "text") and c.text:
                 return c.text
         return str(resp)
+    except Exception:
+        return str(resp)
+
+
+def generate_with_gemini(question, retrieved_texts):
+    q_lower = (question or "").lower().strip()
+    if q_lower in {"hi", "hello", "hey", "hey there", "hi there"}:
+        return "Hello! I'm FloatChat. How can I help you today?"
+    if MODEL_HANDLE is None:
+        return "⚠️ Gemini not configured or not available. I can show retrieved summaries instead."
+
+    context = "\n\n".join(f"[DOC {i+1}] {t.get('summary','')[:1000]}" for i, t in enumerate(retrieved_texts)) or ""
+    prompt = f"{context}\n\nUser: {question}\nAnswer as FloatChat:"
+    try:
+        resp = MODEL_HANDLE.generate_content(prompt, generation_config={"max_output_tokens":300, "temperature":0.3})
+        return _extract_text(resp)
     except Exception as e:
-        return f"Gemini generation failed: {e}"
+        return f"Gemini call failed: {e}"
 
-# ---------------- DB fetch & ranking helpers ----------------
-def fetch_candidates(year: Optional[int], region: Optional[str],
-                     lat_min: Optional[float], lat_max: Optional[float],
-                     lon_min: Optional[float], lon_max: Optional[float],
-                     limit: int = 200) -> List[Dict]:
-    """
-    Fetch candidate rows from netcdf_files table.
-    Falls back to inferring year from file_name if DB.year is NULL.
-    """
-    clauses = []
-    params = {}
 
-    if region and region != "all":
-        clauses.append("ocean_region = :region")
-        params["region"] = region
+def speak_text_tts(text):
+    if not GTTS_AVAILABLE or not text or not text.strip():
+        return None
+    try:
+        tts = gTTS(text=text, lang='en')
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            path = tmp.name
+        tts.save(path)
+        data = open(path, "rb").read()
+        os.remove(path)
+        return data
+    except Exception:
+        return None
 
-    if lat_min is not None:
-        clauses.append("lat_max >= :lat_min")
-        params["lat_min"] = lat_min
-    if lat_max is not None:
-        clauses.append("lat_min <= :lat_max")
-        params["lat_max"] = lat_max
-    if lon_min is not None:
-        clauses.append("lon_max >= :lon_min")
-        params["lon_min"] = lon_min
-    if lon_max is not None:
-        clauses.append("lon_min <= :lon_max")
-        params["lon_max"] = lon_max
 
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    sql = f"""
-    SELECT id, file_url, file_name, year, ocean_region, summary,
-           lat_min, lat_max, lon_min, lon_max, time_start, time_end
-    FROM netcdf_files
-    {where}
-    ORDER BY id DESC
-    LIMIT :limit
-    """
-    params["limit"] = limit
-    results = []
-    with engine.connect() as conn:
-        rows = conn.execute(text(sql), params).fetchall()
-        for r in rows:
-            rec = dict(r._mapping)
-            # Infer year if missing
-            if not rec.get("year") and rec.get("file_name"):
-                try:
-                    rec["year"] = int(rec["file_name"][:4])
-                except Exception:
-                    pass
-            results.append(rec)
+def build_messages_html(messages):
+    parts = []
+    for m in reversed(messages):
+        ts = datetime.fromtimestamp(m.get("ts", time.time())).strftime("%I:%M %p")
+        txt = html.escape(m.get("text", "") or "")
+        cls = "user" if m["role"] == "user" else "bot"
+        who = "You" if m["role"] == "user" else "FloatChat"
+        parts.append(f'<div class="bubble {cls}"><div>{txt}</div><div class="meta">{who} • {ts}</div></div>')
+    return "\n".join(parts)
 
-    # Apply year filter after fallback
-    if year:
-        results = [r for r in results if str(r.get("year")) == str(year)]
-    return results
+
+def clear_conversation():
+    st.session_state.messages = []
+
+# ---------------- Ranking helpers (numpy fallback if no FAISS) ----------------
 
 def embed_texts(texts: List[str]) -> np.ndarray:
     if not texts:
-        return np.zeros((0, sbert.get_sentence_embedding_dimension()), dtype=np.float32)
-    embs = sbert.encode(texts, show_progress_bar=False)
+        return np.zeros((0, model.get_sentence_embedding_dimension()), dtype=np.float32)
+    embs = model.encode(texts, show_progress_bar=False)
     arr = np.array(embs, dtype=np.float32)
     norms = np.linalg.norm(arr, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     arr = arr / norms
     return arr
 
+
 def top_k_by_cosine(query: str, docs: List[Dict], k: int = 5):
     summaries = [d.get("summary") or "" for d in docs]
     if len(summaries) == 0:
         return []
-    doc_embs = embed_texts(summaries)
-    q_emb = embed_texts([query])[0]
-    sims = (doc_embs @ q_emb).astype(float)
-    idx = np.argsort(-sims)[:k]
-    results = []
-    for i in idx:
-        results.append({"score": float(sims[i]), "doc": docs[i]})
-    return results
-
-def synthesize_answer_locally(question: str, top_docs: List[Dict]) -> str:
-    if not top_docs:
-        return "No documents found for the selected filters."
-    parts = [f"- {d['doc'].get('summary')[:500]}..." for d in top_docs]
-    answer = f"I found {len(top_docs)} relevant documents. Top summaries:\n\n" + "\n\n".join(parts)
-    return answer
-
-# ---------------- Streamlit UI ----------------
-st.set_page_config(page_title="FloatChat — RAG", layout="centered")
-st.title("FloatChat — RAG (NetCDF metadata)")
-
-with st.sidebar:
-    st.markdown("### Filters")
-    year = st.number_input("Year", min_value=1900, max_value=2100, value=2025, step=1)
-    region = st.selectbox("Region", options=["indian", "atlantic", "all"], index=0)
-    use_bbox = st.checkbox("Filter by bounding box (lat/lon)?", value=False)
-    lat_min = lat_max = lon_min = lon_max = None
-    if use_bbox:
-        lat_min = st.number_input("lat_min", value=-90.0, format="%.6f")
-        lat_max = st.number_input("lat_max", value=90.0, format="%.6f")
-        lon_min = st.number_input("lon_min", value=-180.0, format="%.6f")
-        lon_max = st.number_input("lon_max", value=180.0, format="%.6f")
-    top_k = st.slider("Documents to retrieve (k)", 1, 10, 5)
-
-st.markdown(f"**DB:** {mask_db_url(DATABASE_URL)} — connection looks configured.")
-if GEMINI_PACKAGE_AVAILABLE:
-    st.caption("Gemini package installed. Gemini will be used if GEMINI_API_KEY is set.")
-else:
-    st.caption("Gemini package not available; local synthesis will be used unless GEMINI configured.")
-
-st.markdown("---")
-question = st.text_area("Ask a question (about year, region, variables, summaries, etc.)", height=120)
-run = st.button("Search & Answer")
-
-if run:
-    filter_region = None if region == "all" else region
-    with st.spinner("Fetching candidates from DB..."):
-        candidates = fetch_candidates(year if year else None, filter_region, lat_min, lat_max, lon_min, lon_max, limit=500)
-    st.success(f"Found {len(candidates)} candidate rows in DB (pre-filter)")
-
-    if not candidates:
-        st.info("No candidates found for these filters.")
+    if FAISS_AVAILABLE and index is not None:
+        # use FAISS for speed
+        q_emb = model.encode([query], show_progress_bar=False)
+        q_arr = np.array(q_emb, dtype=np.float32)
+        faiss.normalize_L2(q_arr)
+        D, I = index.search(q_arr, k)
+        results = []
+        for i, score in zip(I[0], D[0]):
+            if i < 0 or i >= len(docs):
+                continue
+            results.append({"score": float(score), "doc": docs[i]})
+        return results
     else:
-        with st.spinner("Ranking candidates with SBERT..."):
-            top = top_k_by_cosine(question, candidates, k=top_k)
+        # numpy SBERT ranking
+        doc_embs = embed_texts(summaries)
+        q_emb = embed_texts([query])[0]
+        sims = (doc_embs @ q_emb).astype(float)
+        idx = np.argsort(-sims)[:k]
+        results = []
+        for i in idx:
+            results.append({"score": float(sims[i]), "doc": docs[i]})
+        return results
 
-        st.markdown("### Top documents")
-        for i, t in enumerate(top, start=1):
-            doc = t["doc"]
-            st.markdown(f"**{i}. score {t['score']:.4f} — {html.escape(doc.get('file_name') or doc.get('file_url'))}**")
-            st.markdown(f"*{html.escape((doc.get('summary') or '')[:700])}*")
-            st.caption(f"url: {doc.get('file_url')}")
-            st.write("---")
+# ---------------- App Layout ----------------
+st.set_page_config(page_title="FloatChat — RAG", layout="centered")
+st.markdown('<div class="topbar">🌊 FLOATCHAT</div>', unsafe_allow_html=True)
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+messages_placeholder = st.empty()
 
-        if GEMINI_API_KEY and GEMINI_PACKAGE_AVAILABLE:
-            with st.spinner("Generating answer with Gemini..."):
-                ans = generate_with_gemini(question, top)
-            st.markdown("### Answer (Gemini)")
-            st.write(ans)
+
+def render_messages():
+    messages_placeholder.markdown(f'<div class="messages">{build_messages_html(st.session_state.messages)}</div>', unsafe_allow_html=True)
+
+render_messages()
+
+with st.form("chat", clear_on_submit=True):
+    cols = st.columns([8, 2])
+    user_input = cols[0].text_input("Message", placeholder="Type your message...", key="text_input",
+                                  label_visibility="collapsed")
+    send = cols[1].form_submit_button("Send")
+    if send and user_input.strip():
+        text = user_input.strip()
+        st.session_state.messages.append({"role": "user", "text": text, "ts": time.time()})
+
+        # Build list of candidate docs from meta (already loaded)
+        # We keep behavior simple: search the meta list (which was built from DB if available)
+        candidates = meta[:]  # copy
+
+        # If no candidates (shouldn't happen), show message
+        if not candidates:
+            bot_text = "No documents available to search."
         else:
-            ans = synthesize_answer_locally(question, top)
-            st.markdown("### Answer (Local synth)")
-            st.write(ans)
+            # get top docs by cosine
+            top_docs = top_k_by_cosine(text, candidates, k=3)
+            retrieved = [t['doc'] for t in top_docs]
+            # Generate answer: Gemini if configured, else local synth
+            if MODEL_HANDLE is not None and GEMINI_API_KEY:
+                bot_text = generate_with_gemini(text, retrieved)
+            else:
+                # local synth: concatenate top summaries
+                parts = [f"- {d.get('summary','')[:400]}..." for d in retrieved]
+                bot_text = "I found the following top summaries:\n\n" + "\n\n".join(parts)
 
-st.markdown("---")
-st.caption("FloatChat RAG — retrieves summaries from Supabase/Postgres and ranks with SBERT.")
+        st.session_state.messages.append({"role": "bot", "text": bot_text, "ts": time.time()})
+        render_messages()
+        mp3 = speak_text_tts(bot_text)
+        if mp3:
+            st.audio(mp3, format="audio/mp3")
+
+if st.button("Clear Conversation"):
+    clear_conversation()
+    st.rerun()
+
+st.markdown('<div class="footer">Powered by FloatChat 🌊</div>', unsafe_allow_html=True)
