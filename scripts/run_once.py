@@ -1,73 +1,50 @@
 # scripts/run_once.py
 """
-Orchestration script: crawl → download → ingest for IFREMER roots.
-This version uses lazy imports to avoid module import-time errors in CI.
+Debugging wrapper to inspect the downloader module at import time.
+Runs a light check and prints module import exceptions and contents.
+After we find the issue, we'll restore the functional orchestration.
 """
 
-import asyncio
-import os
+import importlib
+import traceback
+import sys
 
-# Limit years for quick CI runs (set to None for full)
-CI_MAX_YEARS = 1  # set to 1 for testing; change to None to process all years
+CI_MAX_YEARS = 1
 
-# Roots to crawl
 ROOTS = [
     ("https://data-argo.ifremer.fr/geo/atlantic_ocean/", "atlantic"),
     ("https://data-argo.ifremer.fr/geo/indian_ocean/", "indian"),
 ]
 
-def process_sync_for_root(root_url, region, max_years=None):
-    # Lazy imports
-    from downloader.crawler import list_files_sync
-    from downloader.downloader import download_batch_sync
-    from downloader.ingest import ingest_file_entry
-
-    print("Listing files for", root_url)
-    files = list_files_sync(root_url, max_years=max_years)
-    print("Found", len(files), "files (limited view)")
-    if not files:
-        return
-    downloaded = download_batch_sync(files, concurrency=4)
-    print("Downloaded new files:", len(downloaded))
-    for entry in downloaded:
-        try:
-            ingest_file_entry(entry, ocean_region=region)
-        except Exception as e:
-            print("Ingest failed for", entry.get("url"), e)
-
-async def process_async_for_root(root_url, region, max_years=None):
-    # Lazy imports
-    from downloader.crawler import crawl_root_for_files
-    from downloader.downloader import download_batch
-    from downloader.ingest import ingest_file_entry
-
-    print("Crawling", root_url)
-    files = await crawl_root_for_files(root_url, max_years=max_years)
-    print("Found", len(files), "files")
-    if not files:
-        return
-    downloaded = await download_batch(files)
-    print("Downloaded new files:", len(downloaded))
-    for entry in downloaded:
-        try:
-            ingest_file_entry(entry, ocean_region=region)
-        except Exception as e:
-            print("Ingest failed for", entry.get("url"), e)
+def inspect_downloader_module():
+    print("=== Inspecting downloader.downloader module import ===")
+    try:
+        mod = importlib.import_module("downloader.downloader")
+        print("Imported module:", mod)
+        print("Module file:", getattr(mod, "__file__", "<no __file__>"))
+        names = sorted(name for name in dir(mod) if not name.startswith("_"))
+        print("Public names in downloader.downloader:", names)
+        # Print signature hints if available
+        for key in ("download_batch","download_batch_sync","download_if_new"):
+            if key in names:
+                print(f"- {key} is present in module.")
+            else:
+                print(f"- {key} NOT FOUND in module.")
+    except Exception as e:
+        print("Import failed with exception:")
+        traceback.print_exc()
+        return False
+    return True
 
 def main():
-    max_years = CI_MAX_YEARS
-
-    # Prefer async orchestration where possible
-    loop = asyncio.get_event_loop()
-    for root_url, region in ROOTS:
-        try:
-            loop.run_until_complete(process_async_for_root(root_url, region, max_years=max_years))
-        except Exception as e:
-            print("Async run failed, falling back to sync for", root_url, e)
-            try:
-                process_sync_for_root(root_url, region, max_years=max_years)
-            except Exception as ee:
-                print("Sync fallback also failed for", root_url, ee)
+    ok = inspect_downloader_module()
+    if not ok:
+        print("Downloader module failed to import — see traceback above.")
+        sys.exit(2)
+    else:
+        print("Downloader module import appears OK. Next step would be to run crawling/downloading.")
+        # Optionally, we can proceed to a minimal crawl test here, but stop for now.
+        # This keeps CI short and focused on diagnosing the import issue.
 
 if __name__ == "__main__":
     main()
