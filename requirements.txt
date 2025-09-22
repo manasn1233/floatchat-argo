@@ -8,3 +8,4 @@ netCDF4
 python-dotenv
 streamlit
 pgvector
+beautifulsoup4
