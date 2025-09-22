@@ -10,3 +10,6 @@ streamlit
 pgvector
 beautifulsoup4
 google-generativeai==0.8.5
+faiss-cpu
+numpy
+gtts
