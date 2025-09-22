@@ -1,7 +1,13 @@
 # downloader/downloader.py
 """
-Robust downloader: check Content-Length first, skip very large files, retry on transient errors,
-and stream the file to disk. Designed for CI runs where a single stuck download can hang the job.
+Robust downloader with retries and server-error handling.
+
+Behavior:
+- HEAD check for Content-Length (skip if too large)
+- Stream download to .part file then rename on success
+- Retry on 5xx and 429 (honor Retry-After if provided)
+- Exponential backoff with jitter
+- Logs actions so CI shows why a file was skipped/failed
 """
 
 import os
@@ -11,6 +17,8 @@ import aiohttp
 import aiofiles
 from urllib.parse import urlparse
 import time
+import random
+import datetime
 
 from db import db_helpers
 from sqlalchemy import text
@@ -18,11 +26,18 @@ from sqlalchemy import text
 DATA_DIR = os.getenv("DATA_DIR", "./data/netcdf")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# tune these as needed
-MAX_SIZE_BYTES = int(os.getenv("MAX_SIZE_BYTES", 60 * 1024 * 1024))  # 60 MB default
-DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", 120))  # seconds per request
-RETRIES = int(os.getenv("DOWNLOAD_RETRIES", 3))
+# Tunables (can be overridden via env in Actions)
+MAX_SIZE_BYTES = int(os.getenv("MAX_SIZE_BYTES", 60 * 1024 * 1024))  # 60 MB
+DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", 120))  # seconds for connect/read
+RETRIES = int(os.getenv("DOWNLOAD_RETRIES", 4))
 CONCURRENCY = int(os.getenv("DOWNLOAD_CONCURRENCY", 3))
+SKIP_AFTER_ATTEMPTS = int(os.getenv("SKIP_AFTER_ATTEMPTS", 4))
+
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
 def compute_checksum(path):
     h = hashlib.sha256()
@@ -31,37 +46,60 @@ def compute_checksum(path):
             h.update(chunk)
     return h.hexdigest()
 
+# Custom exceptions
+class ServerError(Exception):
+    pass
+
+class RateLimitError(Exception):
+    def __init__(self, retry_after):
+        super().__init__("Rate limited")
+        self.retry_after = retry_after
+
+class ClientError(Exception):
+    pass
+
+def backoff_seconds(attempt, base=1.0, cap=60.0):
+    delay = min(cap, base * (2 ** (attempt - 1)))
+    jitter = random.uniform(0, delay * 0.5)
+    return delay + jitter
+
 async def head_size(session, url):
-    """
-    Try to perform a HEAD to get Content-Length. Return int bytes or None.
-    Some servers may not respond to HEAD; handle gracefully.
-    """
     try:
-        async with session.head(url, timeout=DOWNLOAD_TIMEOUT) as resp:
+        async with session.head(url, timeout=DOWNLOAD_TIMEOUT, headers=DEFAULT_HEADERS) as resp:
             if resp.status == 200:
                 cl = resp.headers.get("Content-Length")
                 if cl and cl.isdigit():
                     return int(cl)
+            # treat other statuses as unknown size (None)
     except Exception as e:
-        # HEAD may be blocked or unsupported; ignore and return None
         print("HEAD failed for", url, ":", e)
     return None
 
-async def download_file(session, url, dst_path):
-    """
-    Stream download with per-chunk writes. Raises on non-200 or network errors.
-    """
+async def download_stream(session, url, dst_path):
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=DOWNLOAD_TIMEOUT, sock_read=DOWNLOAD_TIMEOUT)
-    async with session.get(url, timeout=timeout) as resp:
-        resp.raise_for_status()
-        async with aiofiles.open(dst_path, "wb") as f:
+    async with session.get(url, timeout=timeout, headers=DEFAULT_HEADERS) as resp:
+        status = resp.status
+        if status >= 500:
+            body = await resp.text()[:400]
+            raise ServerError(f"{status}: {body}")
+        if status == 429:
+            ra = resp.headers.get("Retry-After")
+            raise RateLimitError(ra)
+        if status >= 400:
+            body = await resp.text()[:400]
+            raise ClientError(f"{status}: {body}")
+
+        part = dst_path + ".part"
+        async with aiofiles.open(part, "wb") as f:
             async for chunk in resp.content.iter_chunked(64 * 1024):
                 if not chunk:
                     break
                 await f.write(chunk)
+        # move into final filename
+        os.replace(part, dst_path)
 
 async def download_if_new(session, url, conn):
-    # DB check
+    # skip if already recorded
     already = conn.execute(text("SELECT id FROM netcdf_files WHERE file_url = :u"), {"u": url}).fetchone()
     if already:
         print("Already in DB, skipping:", url)
@@ -70,7 +108,7 @@ async def download_if_new(session, url, conn):
     file_name = os.path.basename(urlparse(url).path)
     dst_path = os.path.join(DATA_DIR, file_name)
 
-    # check size via HEAD
+    # HEAD size check
     size = await head_size(session, url)
     if size is not None:
         print("Content-Length for", url, "=", size, "bytes")
@@ -78,27 +116,59 @@ async def download_if_new(session, url, conn):
             print(f"Skipping {url} because size {size} > MAX_SIZE_BYTES {MAX_SIZE_BYTES}")
             return None
 
-    # attempt with retries
     last_exc = None
     for attempt in range(1, RETRIES + 1):
         try:
-            await download_file(session, url, dst_path)
+            await download_stream(session, url, dst_path)
             checksum = compute_checksum(dst_path)
             print("Downloaded", url, "->", dst_path, "checksum", checksum)
             return {"url": url, "local_path": dst_path, "file_name": file_name, "checksum": checksum}
-        except Exception as e:
-            last_exc = e
-            print(f"Attempt {attempt} failed for {url}: {e}")
-            # clean partial file
-            if os.path.exists(dst_path):
+        except RateLimitError as rl:
+            ra = rl.retry_after
+            if ra:
                 try:
-                    os.remove(dst_path)
+                    wait = int(ra)
                 except Exception:
-                    pass
-            # small backoff
-            await asyncio.sleep(2 * attempt)
-    # all retries failed
-    print("All retries failed for", url, "last_exc:", last_exc)
+                    # try parse HTTP date or fallback
+                    try:
+                        wait = int((datetime.datetime.strptime(ra, "%a, %d %b %Y %H:%M:%S %Z") - datetime.datetime.utcnow()).total_seconds())
+                    except Exception:
+                        wait = int(backoff_seconds(attempt))
+            else:
+                wait = int(backoff_seconds(attempt))
+            print(f"Rate limited on {url}, waiting {wait}s (attempt {attempt})")
+            await asyncio.sleep(wait)
+            last_exc = rl
+            continue
+        except ServerError as se:
+            wait = backoff_seconds(attempt)
+            print(f"Server error for {url}: {se}. Backing off {wait:.1f}s (attempt {attempt})")
+            await asyncio.sleep(wait)
+            last_exc = se
+            continue
+        except ClientError as ce:
+            print(f"Client error for {url}, skipping: {ce}")
+            last_exc = ce
+            break
+        except Exception as e:
+            wait = backoff_seconds(attempt)
+            print(f"Transient error for {url}: {e}. Backing off {wait:.1f}s (attempt {attempt})")
+            await asyncio.sleep(wait)
+            last_exc = e
+            continue
+
+    # after retries failed: log and optionally record failure in DB
+    print("Failed to download after retries:", url, "last_exc:", last_exc)
+    try:
+        conn.execute(text(
+            "INSERT INTO download_failures (file_url, last_error, attempts, last_attempt) "
+            "VALUES (:u, :err, :a, now()) "
+            "ON CONFLICT (file_url) DO UPDATE SET last_error = EXCLUDED.last_error, attempts = download_failures.attempts + 1, last_attempt = now()"
+        ), {"u": url, "err": str(last_exc), "a": RETRIES})
+        conn.commit()
+    except Exception:
+        pass
+
     return None
 
 async def download_batch(urls, concurrency=CONCURRENCY):
@@ -119,7 +189,6 @@ async def download_batch(urls, concurrency=CONCURRENCY):
         await asyncio.gather(*tasks)
     return results
 
-# convenience sync wrapper
 def download_batch_sync(urls, concurrency=CONCURRENCY):
     return asyncio.run(download_batch(urls, concurrency=concurrency))
 
@@ -127,7 +196,7 @@ if __name__ == "__main__":
     sample = [
         "https://data-argo.ifremer.fr/geo/atlantic_ocean/2019/08/20190801_prof.nc"
     ]
-    print("Testing download (local)...")
+    print("Local test (not in CI):")
     try:
         res = download_batch_sync(sample)
         print("Downloaded:", res)
