@@ -1,16 +1,14 @@
 # scripts/run_once.py
 """
 Orchestration script: crawl → download → ingest for IFREMER roots.
-Designed to be run in CI (GitHub Actions) or locally (with network access).
-It processes two roots: atlantic_ocean and indian_ocean by default.
+This version uses lazy imports to avoid module import-time errors in CI.
 """
 
 import asyncio
 import os
-from downloader.crawler import crawl_root_for_files, list_files_sync
-from downloader.downloader import download_batch, download_batch_sync
-from downloader.ingest import ingest_file_entry
-from urllib.parse import urlparse
+
+# Limit years for quick CI runs (set to None for full)
+CI_MAX_YEARS = 1  # set to 1 for testing; change to None to process all years
 
 # Roots to crawl
 ROOTS = [
@@ -18,16 +16,17 @@ ROOTS = [
     ("https://data-argo.ifremer.fr/geo/indian_ocean/", "indian"),
 ]
 
-# Limit years for quick CI runs (set to None for full)
-CI_MAX_YEARS = 1  # set to 1 or 2 to test quickly
-
 def process_sync_for_root(root_url, region, max_years=None):
+    # Lazy imports
+    from downloader.crawler import list_files_sync
+    from downloader.downloader import download_batch_sync
+    from downloader.ingest import ingest_file_entry
+
     print("Listing files for", root_url)
     files = list_files_sync(root_url, max_years=max_years)
     print("Found", len(files), "files (limited view)")
     if not files:
         return
-    # Download only new (sync)
     downloaded = download_batch_sync(files, concurrency=4)
     print("Downloaded new files:", len(downloaded))
     for entry in downloaded:
@@ -37,6 +36,11 @@ def process_sync_for_root(root_url, region, max_years=None):
             print("Ingest failed for", entry.get("url"), e)
 
 async def process_async_for_root(root_url, region, max_years=None):
+    # Lazy imports
+    from downloader.crawler import crawl_root_for_files
+    from downloader.downloader import download_batch
+    from downloader.ingest import ingest_file_entry
+
     print("Crawling", root_url)
     files = await crawl_root_for_files(root_url, max_years=max_years)
     print("Found", len(files), "files")
@@ -51,8 +55,6 @@ async def process_async_for_root(root_url, region, max_years=None):
             print("Ingest failed for", entry.get("url"), e)
 
 def main():
-    # If running in CI where network is allowed, use async runner.
-    # For quick local testing without heavy downloads, you can set CI_MAX_YEARS to 1.
     max_years = CI_MAX_YEARS
 
     # Prefer async orchestration where possible
