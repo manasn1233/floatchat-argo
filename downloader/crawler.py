@@ -1,87 +1,106 @@
 # downloader/crawler.py
 """
-Simple crawler to list year folders and .nc files from IFREMER directory pages.
-This is intentionally conservative: it parses HTML index pages and extracts links
-ending with .nc and year directories (YYYY/). If IFREMER exposes a JSON API,
-replace the parsing with JSON fetching for robustness.
+Robust crawler for IFREMER index pages.
+- Uses requests-style headers via aiohttp to present a browser-like User-Agent.
+- Uses BeautifulSoup for reliable link extraction instead of fragile regex.
+- Logs the first N characters of the fetched HTML so we can inspect listing format.
 """
 
-import re
+import asyncio
 from urllib.parse import urljoin
 import aiohttp
-import asyncio
+from bs4 import BeautifulSoup
 
-NC_RE = re.compile(r'href=["\']([^"\']+\.nc)["\']', re.IGNORECASE)
-YEAR_DIR_RE = re.compile(r'href=["\']([0-9]{4})/["\']')
+# How many characters of the index HTML to log (helps debug in CI logs)
+LOG_HTML_CHARS = 2000
+
+# Headers to look like a browser (some servers return different content for bots)
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
 async def fetch_text(session, url, timeout=30):
-    async with session.get(url, timeout=timeout) as resp:
+    async with session.get(url, timeout=timeout, headers=DEFAULT_HEADERS) as resp:
         resp.raise_for_status()
         return await resp.text()
 
 async def list_files_in_folder(session, folder_url):
     """
-    Parse an index HTML page at folder_url and return absolute .nc file URLs found there.
+    Parse folder index and return absolute .nc links found there.
     """
-    text = await fetch_text(session, folder_url)
+    html = await fetch_text(session, folder_url)
+    # Debug: log the beginning of the HTML so we can inspect index format in CI logs
+    print(f"--- BEGIN HTML SNIPPET for {folder_url} ---")
+    print(html[:LOG_HTML_CHARS])
+    print(f"--- END HTML SNIPPET for {folder_url} ---")
+    soup = BeautifulSoup(html, "html.parser")
     links = set()
-    for m in NC_RE.finditer(text):
-        href = m.group(1)
-        full = urljoin(folder_url, href)
-        links.add(full)
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.lower().endswith(".nc"):
+            links.add(urljoin(folder_url, href))
     return sorted(links)
 
-async def list_years(root_url):
+async def list_year_dirs(session, root_url):
     """
-    Return a list of year folder URLs discovered at root_url (e.g., .../atlantic_ocean/).
+    Parse root listing and return absolute year directory URLs (YYYY/).
     """
-    async with aiohttp.ClientSession() as session:
-        text = await fetch_text(session, root_url)
-    years = []
-    for m in YEAR_DIR_RE.finditer(text):
-        y = m.group(1)
-        years.append(urljoin(root_url, f"{y}/"))
-    years = sorted(set(years))
-    return years
+    html = await fetch_text(session, root_url)
+    print(f"--- BEGIN ROOT HTML SNIPPET for {root_url} ---")
+    print(html[:LOG_HTML_CHARS])
+    print(f"--- END ROOT HTML SNIPPET for {root_url} ---")
+    soup = BeautifulSoup(html, "html.parser")
+    years = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        # treat links that are exactly a 4-digit year or end with 'YYYY/'
+        if href.isdigit() and len(href) == 4:
+            years.add(urljoin(root_url, href + "/"))
+        elif href.endswith("/") and href[:-1].isdigit() and len(href[:-1]) == 4:
+            years.add(urljoin(root_url, href))
+    return sorted(years)
 
 async def crawl_root_for_files(root_url, max_years=None):
-    """
-    Crawl the root IFREMER folder and return a list of .nc file URLs found under year folders.
-    max_years: if set, limit to the newest N years discovered (helps testing).
-    """
     files = []
     async with aiohttp.ClientSession() as session:
-        # discover years
-        text = await fetch_text(session, root_url)
-        year_dirs = YEAR_DIR_RE.findall(text)
-        year_dirs = sorted(set(year_dirs))
+        try:
+            years = await list_year_dirs(session, root_url)
+        except Exception as e:
+            print("Failed to fetch or parse root URL:", root_url, e)
+            return []
+
+        if not years:
+            print("No year directories found at root:", root_url)
+            return []
+
         if max_years:
-            year_dirs = year_dirs[-max_years:]
-        for y in year_dirs:
-            year_url = urljoin(root_url, f"{y}/")
+            years = years[-max_years:]
+
+        for yurl in years:
             try:
-                found = await list_files_in_folder(session, year_url)
+                found = await list_files_in_folder(session, yurl)
                 files.extend(found)
-            except Exception:
-                # skip problematic year pages but continue
+            except Exception as e:
+                print("Failed to parse year folder", yurl, e)
                 continue
+
     return sorted(files)
 
-# Simple sync wrapper for convenience (useful for tests / running locally)
+# Sync wrapper for convenience
 def list_files_sync(root_url, max_years=None):
     return asyncio.run(crawl_root_for_files(root_url, max_years=max_years))
 
 if __name__ == "__main__":
-    # quick local test (won't run in Actions without network)
+    # quick manual test (not run in Actions)
     roots = [
         "https://data-argo.ifremer.fr/geo/atlantic_ocean/",
         "https://data-argo.ifremer.fr/geo/indian_ocean/"
     ]
     for r in roots:
         try:
-            files = list_files_sync(r, max_years=1)  # limit for a quick test
-            print(r, "->", len(files), "files (sample):")
-            for f in files[:5]:
-                print("  ", f)
+            res = list_files_sync(r, max_years=1)
+            print(r, "->", len(res), "files sample:", res[:5])
         except Exception as e:
-            print("Error crawling", r, e)
+            print("crawl failed for", r, e)
