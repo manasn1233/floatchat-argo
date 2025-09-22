@@ -1,204 +1,174 @@
-# downloader/downloader.py
+# downloader/crawler.py
 """
-Robust downloader with retries and server-error handling.
-
-Behavior:
-- HEAD check for Content-Length (skip if too large)
-- Stream download to .part file then rename on success
-- Retry on 5xx and 429 (honor Retry-After if provided)
-- Exponential backoff with jitter
-- Logs actions so CI shows why a file was skipped/failed
+Robust crawler for IFREMER index pages (newest-year-first).
+- Uses aiohttp with a browser-like User-Agent.
+- Uses BeautifulSoup for reliable link extraction.
+- Finds year directories, sorts them newest-first, and crawls only the newest N years when requested.
+- Recursively follows links up to a depth limit to find .nc files.
+- Logs HTML snippets and discovered hrefs for debugging in CI logs.
 """
 
-import os
-import hashlib
 import asyncio
+from urllib.parse import urljoin, urlparse
 import aiohttp
-import aiofiles
-from urllib.parse import urlparse
-import time
-import random
-import datetime
-
-from db import db_helpers
-from sqlalchemy import text
-
-DATA_DIR = os.getenv("DATA_DIR", "./data/netcdf")
-os.makedirs(DATA_DIR, exist_ok=True)
-
-# Tunables (can be overridden via env in Actions)
-MAX_SIZE_BYTES = int(os.getenv("MAX_SIZE_BYTES", 60 * 1024 * 1024))  # 60 MB
-DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", 120))  # seconds for connect/read
-RETRIES = int(os.getenv("DOWNLOAD_RETRIES", 4))
-CONCURRENCY = int(os.getenv("DOWNLOAD_CONCURRENCY", 3))
-SKIP_AFTER_ATTEMPTS = int(os.getenv("SKIP_AFTER_ATTEMPTS", 4))
+from bs4 import BeautifulSoup
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
+LOG_HTML_CHARS = 2000
 
-def compute_checksum(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-# Custom exceptions
-class ServerError(Exception):
-    pass
-
-class RateLimitError(Exception):
-    def __init__(self, retry_after):
-        super().__init__("Rate limited")
-        self.retry_after = retry_after
-
-class ClientError(Exception):
-    pass
-
-def backoff_seconds(attempt, base=1.0, cap=60.0):
-    delay = min(cap, base * (2 ** (attempt - 1)))
-    jitter = random.uniform(0, delay * 0.5)
-    return delay + jitter
-
-async def head_size(session, url):
-    try:
-        async with session.head(url, timeout=DOWNLOAD_TIMEOUT, headers=DEFAULT_HEADERS) as resp:
-            if resp.status == 200:
-                cl = resp.headers.get("Content-Length")
-                if cl and cl.isdigit():
-                    return int(cl)
-            # treat other statuses as unknown size (None)
-    except Exception as e:
-        print("HEAD failed for", url, ":", e)
-    return None
-
-async def download_stream(session, url, dst_path):
-    timeout = aiohttp.ClientTimeout(total=None, sock_connect=DOWNLOAD_TIMEOUT, sock_read=DOWNLOAD_TIMEOUT)
+async def fetch_text(session, url, timeout=30):
     async with session.get(url, timeout=timeout, headers=DEFAULT_HEADERS) as resp:
-        status = resp.status
-        if status >= 500:
-            body = await resp.text()[:400]
-            raise ServerError(f"{status}: {body}")
-        if status == 429:
-            ra = resp.headers.get("Retry-After")
-            raise RateLimitError(ra)
-        if status >= 400:
-            body = await resp.text()[:400]
-            raise ClientError(f"{status}: {body}")
+        resp.raise_for_status()
+        return await resp.text()
 
-        part = dst_path + ".part"
-        async with aiofiles.open(part, "wb") as f:
-            async for chunk in resp.content.iter_chunked(64 * 1024):
-                if not chunk:
-                    break
-                await f.write(chunk)
-        # move into final filename
-        os.replace(part, dst_path)
+async def extract_links(html, base_url):
+    soup = BeautifulSoup(html, "html.parser")
+    links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        full = urljoin(base_url, href)
+        links.append((href, full))
+    return links
 
-async def download_if_new(session, url, conn):
-    # skip if already recorded
-    already = conn.execute(text("SELECT id FROM netcdf_files WHERE file_url = :u"), {"u": url}).fetchone()
-    if already:
-        print("Already in DB, skipping:", url)
-        return None
+async def list_year_dirs(session, root_url):
+    """
+    Parse root listing and return a list of year directory absolute URLs,
+    sorted newest-first (descending).
+    """
+    html = await fetch_text(session, root_url)
+    print(f"--- BEGIN ROOT HTML SNIPPET for {root_url} ---")
+    print(html[:LOG_HTML_CHARS])
+    print(f"--- END ROOT HTML SNIPPET for {root_url} ---")
+    soup = BeautifulSoup(html, "html.parser")
+    years = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        # accept 'YYYY' and 'YYYY/' patterns
+        if href.isdigit() and len(href) == 4:
+            years.add(href)
+        elif href.endswith("/") and href[:-1].isdigit() and len(href[:-1]) == 4:
+            years.add(href[:-1])
+    # sort descending (newest first)
+    sorted_years = sorted(years, reverse=True)
+    return [urljoin(root_url, f"{y}/") for y in sorted_years]
 
-    file_name = os.path.basename(urlparse(url).path)
-    dst_path = os.path.join(DATA_DIR, file_name)
+async def list_files_in_folder(session, folder_url):
+    """
+    Parse a folder index page and return absolute .nc links found there.
+    """
+    html = await fetch_text(session, folder_url)
+    print(f"--- BEGIN HTML SNIPPET for {folder_url} ---")
+    print(html[:LOG_HTML_CHARS])
+    print(f"--- END HTML SNIPPET for {folder_url} ---")
+    links = await extract_links(html, folder_url)
+    nc_links = []
+    for raw, full in links:
+        if ".nc" in raw.lower():
+            nc_links.append(full)
+    return sorted(set(nc_links))
 
-    # HEAD size check
-    size = await head_size(session, url)
-    if size is not None:
-        print("Content-Length for", url, "=", size, "bytes")
-        if size > MAX_SIZE_BYTES:
-            print(f"Skipping {url} because size {size} > MAX_SIZE_BYTES {MAX_SIZE_BYTES}")
-            return None
+async def crawl(root_url, max_depth=3, max_pages=500):
+    """
+    BFS crawl root_url up to max_depth to find .nc files.
+    Returns sorted list of unique .nc URLs.
+    """
+    found_nc = set()
+    seen = set()
+    queue = [(root_url, 0)]
+    pages_visited = 0
+    parsed_root = urlparse(root_url).netloc
 
-    last_exc = None
-    for attempt in range(1, RETRIES + 1):
-        try:
-            await download_stream(session, url, dst_path)
-            checksum = compute_checksum(dst_path)
-            print("Downloaded", url, "->", dst_path, "checksum", checksum)
-            return {"url": url, "local_path": dst_path, "file_name": file_name, "checksum": checksum}
-        except RateLimitError as rl:
-            ra = rl.retry_after
-            if ra:
-                try:
-                    wait = int(ra)
-                except Exception:
-                    # try parse HTTP date or fallback
-                    try:
-                        wait = int((datetime.datetime.strptime(ra, "%a, %d %b %Y %H:%M:%S %Z") - datetime.datetime.utcnow()).total_seconds())
-                    except Exception:
-                        wait = int(backoff_seconds(attempt))
-            else:
-                wait = int(backoff_seconds(attempt))
-            print(f"Rate limited on {url}, waiting {wait}s (attempt {attempt})")
-            await asyncio.sleep(wait)
-            last_exc = rl
-            continue
-        except ServerError as se:
-            wait = backoff_seconds(attempt)
-            print(f"Server error for {url}: {se}. Backing off {wait:.1f}s (attempt {attempt})")
-            await asyncio.sleep(wait)
-            last_exc = se
-            continue
-        except ClientError as ce:
-            print(f"Client error for {url}, skipping: {ce}")
-            last_exc = ce
-            break
-        except Exception as e:
-            wait = backoff_seconds(attempt)
-            print(f"Transient error for {url}: {e}. Backing off {wait:.1f}s (attempt {attempt})")
-            await asyncio.sleep(wait)
-            last_exc = e
-            continue
-
-    # after retries failed: log and optionally record failure in DB
-    print("Failed to download after retries:", url, "last_exc:", last_exc)
-    try:
-        conn.execute(text(
-            "INSERT INTO download_failures (file_url, last_error, attempts, last_attempt) "
-            "VALUES (:u, :err, :a, now()) "
-            "ON CONFLICT (file_url) DO UPDATE SET last_error = EXCLUDED.last_error, attempts = download_failures.attempts + 1, last_attempt = now()"
-        ), {"u": url, "err": str(last_exc), "a": RETRIES})
-        conn.commit()
-    except Exception:
-        pass
-
-    return None
-
-async def download_batch(urls, concurrency=CONCURRENCY):
-    results = []
-    sem = asyncio.Semaphore(concurrency)
     async with aiohttp.ClientSession() as session:
-        async def worker(u):
-            async with sem:
-                with db_helpers.engine.connect() as conn:
-                    try:
-                        res = await download_if_new(session, u, conn)
-                        if res:
-                            results.append(res)
-                    except Exception as e:
-                        print("Failed to download", u, e)
+        while queue and pages_visited < max_pages:
+            url, depth = queue.pop(0)
+            if url in seen:
+                continue
+            seen.add(url)
+            pages_visited += 1
+            try:
+                html = await fetch_text(session, url)
+            except Exception as e:
+                print(f"Failed to fetch {url}: {e}")
+                continue
 
-        tasks = [asyncio.create_task(worker(u)) for u in urls]
-        await asyncio.gather(*tasks)
-    return results
+            # log HTML snippet for debugging
+            print(f"--- BEGIN HTML SNIPPET for {url} ---")
+            print(html[:LOG_HTML_CHARS])
+            print(f"--- END HTML SNIPPET for {url} ---")
 
-def download_batch_sync(urls, concurrency=CONCURRENCY):
-    return asyncio.run(download_batch(urls, concurrency=concurrency))
+            links = await extract_links(html, url)
+            if links:
+                print(f"Found {len(links)} <a> tags on {url}. Sample hrefs:")
+                for raw, full in links[:200]:
+                    print("  href:", raw, "->", full)
+
+            for raw, full in links:
+                lower = raw.lower()
+                if ".nc" in lower or ".nc?" in lower:
+                    found_nc.add(full)
+                else:
+                    # only follow links within same host
+                    parsed = urlparse(full)
+                    if not parsed.netloc or parsed.netloc != parsed_root:
+                        continue
+                    # follow plausible directory or index links
+                    if depth + 1 <= max_depth and (raw.endswith("/") or raw.isdigit() or raw.endswith(".html") or "/" in raw):
+                        if full not in seen:
+                            queue.append((full, depth + 1))
+
+    return sorted(found_nc)
+
+async def crawl_root_for_files(root_url, max_years=None):
+    """
+    Crawl the root_url and return .nc file URLs found under the newest year directories.
+    If max_years is provided, only the newest `max_years` years are traversed.
+    """
+    files = []
+    async with aiohttp.ClientSession() as session:
+        try:
+            years = await list_year_dirs(session, root_url)
+        except Exception as e:
+            print("Failed to fetch or parse root URL:", root_url, e)
+            return []
+
+        if not years:
+            print("No year directories found at root:", root_url)
+            return []
+
+        # pick newest-first top N years if requested
+        if max_years:
+            years = years[:max_years]
+
+        print(f"Will crawl these year folders for {root_url}: {years}")
+
+        for yurl in years:
+            try:
+                found = await list_files_in_folder(session, yurl)
+                files.extend(found)
+            except Exception as e:
+                print("Failed to parse year folder", yurl, e)
+                continue
+
+    return sorted(files)
+
+# synchronous convenience wrapper for local tests / CI compatibility
+def list_files_sync(root_url, max_years=None):
+    return asyncio.run(crawl_root_for_files(root_url, max_years=max_years))
 
 if __name__ == "__main__":
-    sample = [
-        "https://data-argo.ifremer.fr/geo/atlantic_ocean/2019/08/20190801_prof.nc"
+    roots = [
+        "https://data-argo.ifremer.fr/geo/atlantic_ocean/",
+        "https://data-argo.ifremer.fr/geo/indian_ocean/"
     ]
-    print("Local test (not in CI):")
-    try:
-        res = download_batch_sync(sample)
-        print("Downloaded:", res)
-    except Exception as e:
-        print("Test failed:", e)
+    for r in roots:
+        try:
+            res = list_files_sync(r, max_years=1)
+            print(r, "-> found", len(res), "nc files (sample):")
+            for f in res[:10]:
+                print("  ", f)
+        except Exception as e:
+            print("crawl failed for", r, e)
