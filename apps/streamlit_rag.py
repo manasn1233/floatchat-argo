@@ -485,7 +485,8 @@ with st.form("chat", clear_on_submit=True):
         if not candidates:
             bot_text = "No metadata available."
         else:
-            top_docs = top_k_temp := None
+            top_docs = None
+            top_k_temp = None
             # reuse simple rank code
             summaries = [c.get("summary","") for c in candidates]
             doc_embs = model.encode(summaries, show_progress_bar=False)
