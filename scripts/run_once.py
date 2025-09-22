@@ -19,7 +19,7 @@ ROOTS = [
 ]
 
 # Limit years for quick CI runs (set to None for full)
-CI_MAX_YEARS = None  # set to 1 or 2 to test quickly
+CI_MAX_YEARS = 1  # set to 1 or 2 to test quickly
 
 def process_sync_for_root(root_url, region, max_years=None):
     print("Listing files for", root_url)
