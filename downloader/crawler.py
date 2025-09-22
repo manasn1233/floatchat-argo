@@ -4,11 +4,16 @@ Robust crawler for IFREMER index pages (restricted to a root path).
 - Uses aiohttp with a browser-like User-Agent.
 - Uses BeautifulSoup for reliable link extraction.
 - Finds .nc files by crawling only within the path prefix of the given root_url.
+- If root_url points to a region root (e.g. .../indian_ocean/), the crawler will
+  discover year subdirectories automatically and optionally limit to the most
+  recent N years or a MIN_YEAR environment cutoff.
 - Recursively follows links up to a depth limit to find .nc files.
 - Logs HTML snippets and discovered hrefs for debugging in CI logs.
 """
 
+import os
 import asyncio
+import re
 from urllib.parse import urljoin, urlparse
 import aiohttp
 from bs4 import BeautifulSoup
@@ -20,10 +25,12 @@ DEFAULT_HEADERS = {
 }
 LOG_HTML_CHARS = 2000
 
+
 async def fetch_text(session, url, timeout=30):
     async with session.get(url, timeout=timeout, headers=DEFAULT_HEADERS) as resp:
         resp.raise_for_status()
         return await resp.text()
+
 
 async def extract_links(html, base_url):
     soup = BeautifulSoup(html, "html.parser")
@@ -33,6 +40,7 @@ async def extract_links(html, base_url):
         full = urljoin(base_url, href)
         links.append((href, full))
     return links
+
 
 async def list_files_in_folder(session, folder_url):
     """
@@ -48,6 +56,7 @@ async def list_files_in_folder(session, folder_url):
         if ".nc" in raw.lower():
             nc_links.append(full)
     return sorted(set(nc_links))
+
 
 async def crawl(root_url, max_depth=3, max_pages=500):
     """
@@ -97,9 +106,7 @@ async def crawl(root_url, max_depth=3, max_pages=500):
                     continue
 
                 # enforce path prefix restriction: do not follow if path climbs above root_path
-                # e.g., parent directory links like '/geo/indian_ocean/' won't be followed when root_path is '/geo/indian_ocean/2025/'
                 p = parsed.path
-                # ensure trailing slash for directory comparisons
                 p_slash = p if p.endswith("/") else p + "/"
                 if not p_slash.startswith(root_path):
                     # skip links outside the specified root path
@@ -116,27 +123,116 @@ async def crawl(root_url, max_depth=3, max_pages=500):
         # end while
     return sorted(found_nc)
 
-async def crawl_root_for_files(root_url, max_years=None):
+
+async def list_year_dirs_from_root(session, root_url):
+    """
+    Fetch root_url and return a list of year-directory absolute URLs (e.g. .../2025/).
+    Only returns directories that look like 4-digit years.
+    """
+    try:
+        html = await fetch_text(session, root_url)
+    except Exception as e:
+        print(f"Failed to fetch root {root_url} for year discovery: {e}")
+        return []
+
+    links = await extract_links(html, root_url)
+    years = set()
+    for raw, full in links:
+        # match hrefs like '2025/' or '/geo/.../2025/'
+        m = re.match(r"^\d{4}/?$", raw)
+        if m:
+            years.add(full if full.endswith('/') else full + '/')
+        else:
+            # try to parse year from path
+            parsed = urlparse(full)
+            parts = [p for p in parsed.path.split('/') if p]
+            for part in parts:
+                if re.match(r"^\d{4}$", part):
+                    # build absolute year dir URL
+                    year_idx = parsed.path.index(part)
+                    base = full[:full.rfind(part)+len(part)]
+                    years.add(base if base.endswith('/') else base + '/')
+                    break
+    # return sorted ascending
+    try:
+        return sorted(years)
+    except Exception:
+        return list(years)
+
+
+async def crawl_root_for_files(root_url, max_years=None, min_year=None):
     """
     Crawl the root_url and return .nc file URLs found under this root path.
-    If max_years is provided and the root_url is a true root (not a specific year), the caller
-    logic can still choose years — but when root_url points directly at a year folder, this function
-    will only crawl within that year folder because of the path-prefix restriction.
+
+    Behavior:
+    - If root_url appears to be a region root (path ends with the region folder, not a specific year),
+      the function will attempt to discover year subdirectories and then crawl each year folder.
+    - max_years: if provided (int), limit to that many most recent years.
+    - min_year: if provided (int), only include years >= min_year.
     """
-    # For compatibility, we still return the crawl() result; caller must pass the correct root_url
-    return await crawl(root_url, max_depth=3)
+    parsed_root = urlparse(root_url)
+    path = parsed_root.path
+    # detect if root_url already points to a year folder (ends with /YYYY/)
+    year_match = re.search(r"/(\d{4})/+$", path)
+
+    async with aiohttp.ClientSession() as session:
+        if year_match:
+            # it's already year-specific; just crawl this folder
+            return await crawl(root_url, max_depth=3)
+
+        # Otherwise try to discover year dirs under root_url
+        candidate_years = await list_year_dirs_from_root(session, root_url)
+        # candidate_years are absolute URLs like .../2019/
+        # parse numeric year and filter by min_year
+        year_map = []  # list of tuples (year_int, url)
+        for yurl in candidate_years:
+            try:
+                y = int(re.search(r"(\d{4})", yurl).group(1))
+            except Exception:
+                continue
+            if min_year and y < int(min_year):
+                continue
+            year_map.append((y, yurl))
+
+        if not year_map:
+            # fallback: crawl root directly
+            return await crawl(root_url, max_depth=3)
+
+        # sort descending (most recent first)
+        year_map.sort(key=lambda x: x[0], reverse=True)
+
+        # apply max_years if provided
+        if max_years is not None:
+            year_map = year_map[:int(max_years)]
+
+        # iterate years and crawl each year folder, aggregate results
+        all_files = set()
+        for y, yurl in year_map:
+            print(f"Crawling year {y} -> {yurl}")
+            try:
+                files = await crawl(yurl, max_depth=3)
+                for f in files:
+                    all_files.add(f)
+            except Exception as e:
+                print(f"Failed crawling {yurl}: {e}")
+        return sorted(all_files)
+
 
 # synchronous convenience wrapper for local tests / CI compatibility
-def list_files_sync(root_url, max_years=None):
-    return asyncio.run(crawl_root_for_files(root_url, max_years=max_years))
+def list_files_sync(root_url, max_years=None, min_year=None):
+    return asyncio.run(crawl_root_for_files(root_url, max_years=max_years, min_year=min_year))
+
 
 if __name__ == "__main__":
     roots = [
-        "https://data-argo.ifremer.fr/geo/indian_ocean/2025/",
+        "https://data-argo.ifremer.fr/geo/indian_ocean/",
     ]
+    # optional env driven defaults
+    MAX_YEARS = os.getenv("CI_MAX_YEARS")
+    MIN_YEAR = os.getenv("MIN_YEAR")
     for r in roots:
         try:
-            res = list_files_sync(r, max_years=1)
+            res = list_files_sync(r, max_years=MAX_YEARS, min_year=MIN_YEAR)
             print(r, "-> found", len(res), "nc files (sample):")
             for f in res[:20]:
                 print("  ", f)
