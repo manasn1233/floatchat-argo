@@ -77,13 +77,15 @@ async def download_stream(session, url, dst_path):
     async with session.get(url, timeout=timeout, headers=DEFAULT_HEADERS) as resp:
         status = resp.status
         if status >= 500:
-            body = await resp.text()[:400]
+            txt = await resp.text()
+            body = txt[:400]
             raise ServerError(f"{status}: {body}")
         if status == 429:
             ra = resp.headers.get("Retry-After")
             raise RateLimitError(ra)
         if status >= 400:
-            body = await resp.text()[:400]
+            txt = await resp.text()
+            body = txt[:400]
             raise ClientError(f"{status}: {body}")
 
         part = dst_path + ".part"
