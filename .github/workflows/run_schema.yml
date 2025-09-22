@@ -24,4 +24,5 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          python scripts/run_schema.py
+          python -m scripts.run_schema
+
